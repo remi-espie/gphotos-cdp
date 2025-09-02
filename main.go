@@ -78,6 +78,7 @@ var (
 	albumTypeFlag   = flag.String("albumtype", "album", "type of album to download (as seen in URL), has no effect if lastdone file is found or if -start contains full URL")
 	batchSizeFlag   = flag.Int("batchsize", 0, "number of photos to download in one batch")
 	execPathFlag    = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
+	albumName       = flag.Bool("albumname", false, "use album name as download directory")
 )
 
 const gphotosUrl = "https://photos.google.com"
@@ -232,6 +233,7 @@ type Session struct {
 	globalErrChan    chan error
 	userPath         string
 	albumPath        string
+	albumName        string
 	existingItems    sync.Map
 	foundItems       sync.Map
 	downloadedItems  sync.Map
@@ -1004,6 +1006,34 @@ func requestDownload(ctx context.Context, log zerolog.Logger, original bool, has
 	return nil
 }
 
+func (s *Session) getAlbumName(ctx context.Context, log zerolog.Logger) error {
+	var albmName string
+	if err := s.navigateToAlbum(ctx, log); err != nil {
+		return err
+	}
+
+	if err := chromedp.Run(ctx,
+		chromedp.Title(&albmName),
+	); err != nil {
+		return err
+	}
+	albmName = strings.TrimSuffix(albmName, " - Google Photos")
+	albmName = strings.TrimSpace(albmName)
+	if albmName == "" {
+		return errors.New("could not determine album name")
+	}
+	s.albumName = albmName
+	log.Info().Msgf("album name: %s", s.albumName)
+	return nil
+}
+
+func (s *Session) navigateToAlbum(ctx context.Context, log zerolog.Logger) error {
+	if s.userPath+s.albumPath == "" {
+		return nil
+	}
+	return s.navigateWithAction(ctx, log, chromedp.Navigate(gphotosUrl+s.userPath+s.albumPath), "to album "+s.albumPath, 10000*time.Millisecond, 5)
+}
+
 // navigateToPhoto navigates to the photo page for the given image ID.
 func (s *Session) navigateToPhoto(ctx context.Context, log zerolog.Logger, imageId string) error {
 	return s.navigateWithAction(ctx, log, chromedp.Navigate(s.getPhotoUrl(imageId)), "to item "+imageId, 10000*time.Millisecond, 5)
@@ -1294,7 +1324,8 @@ func imageIdFromUrl(location string) (string, error) {
 
 // makeOutDir creates a directory in s.downloadDir named of the item ID
 func (s *Session) makeOutDir(imageId string) (string, error) {
-	newDir := filepath.Join(s.downloadDir, imageId)
+	// if s.albumName is "", it will be ignored and work
+	newDir := filepath.Join(s.downloadDir, s.albumName, imageId)
 	if err := os.MkdirAll(newDir, 0700); err != nil {
 		return "", err
 	}
@@ -1326,7 +1357,7 @@ progressLoop:
 	return nil
 }
 
-// processDownload creates a directory in s.downloadDir with name = imageId and moves the downloaded files into that directory
+// processDownload rename image, add metadata and move to final location
 func (s *Session) processDownload(log zerolog.Logger, downloadInfo NewDownload, isOriginal, hasOriginal bool, imageId string, data PhotoData) error {
 	log.Trace().Msgf("entering processDownload")
 	start := time.Now()
@@ -1677,6 +1708,13 @@ func (s *Session) resync(ctx context.Context) error {
 	defer cancel()
 
 	listenNavEvents(ctx)
+
+	if *albumName && s.albumPath != "" {
+		if err := s.getAlbumName(ctx, log.Logger); err != nil {
+			return fmt.Errorf("error getting album name %s, %w", s.albumPath, err)
+		}
+		log.Info().Msgf("syncing album: %s", s.albumName)
+	}
 
 	lastNode := &cdp.Node{}
 	var nodes []*cdp.Node
