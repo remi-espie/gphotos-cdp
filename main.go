@@ -93,6 +93,7 @@ var errAlreadyDownloaded = errors.New("photo already downloaded")
 var errAbortBatch = errors.New("abort batch")
 var errNavigateAborted = errors.New("navigate aborted")
 var errUnexpectedDownload = errors.New("unexpected download")
+var errCouldNotLoadPhoto = errors.New("photo page failed to load within timeout")
 var fromDate time.Time
 var toDate time.Time
 var loc GPhotosLocale
@@ -884,7 +885,21 @@ func requestDownloadBackup(ctx context.Context, log zerolog.Logger) error {
 	start := time.Now()
 
 	log.Debug().Msgf("requesting download (backup method)")
-	target.ActivateTarget(chromedp.FromContext(ctx).Target.TargetID).Do(ctx)
+
+	// Bound the DevTools-protocol call below — it's synchronous and
+	// inherits the worker's ctx, which has no deadline. If Chrome stops
+	// ACKing target activations (observed on certain poisoned items in
+	// the wild), an unbounded chromedp.Run will hang here forever,
+	// holding the tab lock + blocking startDownload's outer 120s
+	// timeoutTimer from ever running. Cap at 5s so the error bubbles up
+	// to startDownload's retry path.
+	activateCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := target.ActivateTarget(chromedp.FromContext(activateCtx).Target.TargetID).Do(activateCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("activating target for backup download: %w", err)
+	}
+
 	if err := pressButton(ctx, "D", input.ModifierShift); err != nil {
 		return err
 	}
@@ -916,8 +931,15 @@ func pressButton(ctx context.Context, key string, modifier input.Modifier) error
 	for _, ev := range []*input.DispatchKeyEventParams{&down, &up} {
 		log.Trace().Msgf("triggering button press event: %v, %v, %v", ev.Key, ev.Type, ev.Modifiers)
 
-		if err := chromedp.Run(ctx, ev); err != nil {
-			return err
+		// Each keystroke event is an unbounded DevTools-protocol call.
+		// Bound it so a non-ACKing Chrome surfaces as an error within
+		// 5s instead of hanging the caller — see requestDownloadBackup
+		// for the wedge this prevents.
+		pressCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := chromedp.Run(pressCtx, ev)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("dispatching key event %v %v: %w", ev.Key, ev.Type, err)
 		}
 	}
 	return nil
@@ -969,7 +991,13 @@ func requestDownload(ctx context.Context, log zerolog.Logger, original bool, has
 					}
 					return nil
 				}),
-				chromedp.Sleep(10*time.Millisecond),
+				// Wait deterministically for the menu's download item to render,
+				// instead of a fixed 10ms sleep that was too short on slow renders.
+				// Bounded to 500ms — beyond that, fall through and let the outer
+				// retry loop reopen the menu.
+				chromedp.ActionFunc(func(ctx context.Context) error {
+					return doActionWithTimeout(ctx, chromedp.WaitVisible(downloadSelector, chromedp.ByQuery), 500*time.Millisecond)
+				}),
 				chromedp.ActionFunc(func(ctx context.Context) error {
 					if hasOriginal != nil {
 						return chromedp.Evaluate(`!!document.querySelector('`+originalSelector+`')`, hasOriginal).Do(ctx)
@@ -1125,9 +1153,22 @@ func (s *Session) getPhotoData(ctx context.Context, log zerolog.Logger, imageId 
 
 			target.ActivateTarget(chromedp.FromContext(ctx).Target.TargetID).Do(ctx)
 
-			// If video is 'still processing', photo data may never load, so stop here
+			// If video is 'still processing', photo data may never load, so stop here.
+			// Bound this chromedp.Run with a short timeout (#12-style): the outer
+			// getPhotoData ctx has 4 minutes, but when Google's SPA hangs on this
+			// specific photo the chromedp.Run can sit on the unbounded inner call
+			// for the full 4 minutes before bubbling up, holding the tab lock the
+			// whole time and starving every other worker. Cap at 5s; on timeout,
+			// wrap as errCouldNotLoadPhoto so the worker skip-and-continue path
+			// (introduced in e9e7908) handles it rather than failing the run.
 			var undownloadable bool
-			if err := chromedp.Run(ctx, chromedp.Evaluate(`[...document.querySelectorAll('c-wiz[data-media-key*="'+document.location.href.trim().split('/').pop()+'"]')].filter(x => getComputedStyle(x).visibility != 'hidden')[0]?.textContent.indexOf('Your video will be ready soon') >= 0`, &undownloadable)); err != nil {
+			videoCheckCtx, videoCheckCancel := context.WithTimeout(ctx, 5*time.Second)
+			err := chromedp.Run(videoCheckCtx, chromedp.Evaluate(`[...document.querySelectorAll('c-wiz[data-media-key*="'+document.location.href.trim().split('/').pop()+'"]')].filter(x => getComputedStyle(x).visibility != 'hidden')[0]?.textContent.indexOf('Your video will be ready soon') >= 0`, &undownloadable))
+			videoCheckCancel()
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return fmt.Errorf("%w: videoStillProcessing check timed out: %w", errCouldNotLoadPhoto, err)
+				}
 				return fmt.Errorf("while checking if video is still processing %w", err)
 			}
 			if undownloadable {
@@ -1174,8 +1215,18 @@ func (s *Session) getPhotoData(ctx context.Context, log zerolog.Logger, imageId 
 			log.Debug().Int64("duration", time.Since(start).Milliseconds()).Msgf("done attempt to find photo data nodes")
 		}
 
-		if time.Since(start).Seconds() > 200 {
-			return PhotoData{}, fmt.Errorf("timeout waiting for photo info (waited %d ms)", time.Since(start).Milliseconds())
+		// Fast-fail when the page never produces any photo info at all —
+		// usually means Google's SPA hung on this specific photo (a Google
+		// bug we can't fix; observed deterministically on certain items).
+		// Distinct from the 200s "incomplete info" path below, which assumes
+		// some data has loaded and we're waiting on the rest.
+		elapsed := time.Since(start).Seconds()
+		gotAnyData := len(filename) > 0 || len(dateStr) > 0 || len(timeStr) > 0
+		if !gotAnyData && elapsed > 45 {
+			return PhotoData{}, fmt.Errorf("%w: no photo info appeared after 45s — page likely frozen", errCouldNotLoadPhoto)
+		}
+		if elapsed > 200 {
+			return PhotoData{}, fmt.Errorf("%w: incomplete info after 200s (filename=%v date=%v time=%v)", errCouldNotLoadPhoto, len(filename) > 0, len(dateStr) > 0, len(timeStr) > 0)
 		}
 
 		// Do part of the waiting outside of the tab lock, so we don't hog the active tab the whole time
@@ -1225,7 +1276,12 @@ func (s *Session) startDownload(ctx context.Context, log zerolog.Logger, imageId
 				}
 				refreshTimer = time.NewTimer(100 * time.Millisecond)
 			} else {
-				refreshTimer = time.NewTimer(5 * time.Second)
+				// After a successful click, wait long enough for Google to
+				// actually emit EventDownloadWillBegin before assuming the
+				// click was lost and reloading. 5s was too tight for
+				// originals / large zips — the server is preparing the
+				// payload and the event can lag.
+				refreshTimer = time.NewTimer(15 * time.Second)
 			}
 		case <-refreshTimer.C:
 			log.Debug().Msgf("reloading page because download failed to start")
@@ -1717,6 +1773,7 @@ func (s *Session) resync(ctx context.Context) error {
 	}
 
 	lastNode := &cdp.Node{}
+	lastImageId := "" // stable identity for lastNode — survives Google's virtualized list unmount/remount
 	var nodes []*cdp.Node
 	i := 0                         // next node to process in nodes array
 	n := 0                         // number of nodes processed in all
@@ -1757,6 +1814,16 @@ func (s *Session) resync(ctx context.Context) error {
 			case newDownload := <-s.newDownloadChan:
 				worker, exists := workerDownloadChanByFrameId.Load(newDownload.targetId)
 				if !exists {
+					// Routing key mismatch — usually means the EventDownloadWillBegin
+					// arrived with a frame ID that doesn't match any worker's target ID.
+					// Dump the registered worker target IDs so we can tell whether the
+					// listener is reporting iframe frame IDs vs. tab target IDs.
+					var registered []string
+					workerDownloadChanByFrameId.Range(func(k, _ any) bool {
+						registered = append(registered, k.(string))
+						return true
+					})
+					log.Warn().Strs("registeredTargetIds", registered).Msgf("download routing miss: targetId=%s suggestedFilename=%s", newDownload.targetId, newDownload.suggestedFilename)
 					s.globalErrChan <- fmt.Errorf("worker with targetId %s not found for download of %s", newDownload.targetId, newDownload.suggestedFilename)
 					return
 				}
@@ -1789,6 +1856,7 @@ func (s *Session) resync(ctx context.Context) error {
 	// progress logger
 	go func(ctx context.Context) {
 		lastSyncedCount := 0
+		lastDownloadedCount := 0
 		iterationsWithNoProgressCount := 0
 		start := time.Now()
 		for {
@@ -1814,15 +1882,33 @@ func (s *Session) resync(ctx context.Context) error {
 				log.Info().Msgf("in total: synced %v items, downloaded %v, progress: %.2f%%", syncedCount, downloadedCount, progress*100)
 				return
 			}
-			if syncedCount == lastSyncedCount {
+			if syncedCount == lastSyncedCount && downloadedCount == lastDownloadedCount {
 				iterationsWithNoProgressCount++
 				if iterationsWithNoProgressCount > 20 {
-					panic("no new items processed for 20 minutes, stopping sync")
+					// Deadman: neither enumeration nor downloads
+					// have advanced for 20 minutes. Watching both
+					// metrics matters because enumeration legitimately
+					// stalls when the queue is full and workers are
+					// still draining it — that's a healthy state, not
+					// a wedge. We only bail when neither metric moves.
+					//
+					// Report the error and cancel the context so
+					// in-flight chromedp calls unwind cleanly.
+					// Previously a bare panic() left the process to
+					// crash without saving state and without giving
+					// the wrapper a clean exit code to retry against.
+					select {
+					case s.globalErrChan <- fmt.Errorf("no progress (enumeration or downloads) for 20 minutes, stopping sync"):
+					default:
+					}
+					cancel()
+					return
 				}
 			} else {
 				iterationsWithNoProgressCount = 0
 			}
 			lastSyncedCount = syncedCount
+			lastDownloadedCount = downloadedCount
 		}
 	}(ctx)
 
@@ -1892,12 +1978,33 @@ syncAllLoop:
 			}
 			log.Trace().Msgf("found %d items, checking if any are new", len(nodes))
 
-			// remove already processed nodes
+			// Slice off already-processed nodes. Prefer pointer equality
+			// (fast, works in steady-state via chromedp's frame-tree
+			// node interning), then fall back to matching by imageId.
+			// The imageId fallback catches the case where Google's
+			// virtualized list has unmounted the previous lastNode
+			// between this query and the last one, leaving its *cdp.Node
+			// pointer dangling and absent from the new results — pointer
+			// equality silently fails and the dedupe was a no-op, which
+			// could let us re-process old items or skip past unread ones.
 			foundNodes := len(nodes)
+			sliced := false
 			for i, node := range nodes {
 				if node == lastNode {
 					nodes = nodes[i+1:]
+					sliced = true
 					break
+				}
+			}
+			if !sliced && lastImageId != "" {
+				for i, node := range nodes {
+					id, idErr := imageIdFromUrl(node.AttributeValue("href"))
+					if idErr == nil && id == lastImageId {
+						log.Debug().Msgf("scroll anchor recovered by imageId %s after stale NodeID %v", lastImageId, lastNode.NodeID)
+						nodes = nodes[i+1:]
+						sliced = true
+						break
+					}
 				}
 			}
 			if len(nodes) == 0 {
@@ -1905,8 +2012,8 @@ syncAllLoop:
 				continue
 			}
 			log.Trace().Msgf("%d nodes on page, processing %d that haven't been processed yet", foundNodes, len(nodes))
-			if foundNodes == len(nodes) {
-				log.Warn().Msg("only new nodes found, expected an overlap")
+			if !sliced && foundNodes == len(nodes) {
+				log.Warn().Msg("scroll anchor not found by NodeID or imageId — processing full query (isNewItem will filter duplicates)")
 			}
 
 			retries = 0
@@ -1925,6 +2032,7 @@ syncAllLoop:
 			if err != nil {
 				return fmt.Errorf("error getting item id from url, %w", err)
 			}
+			lastImageId = imageId // track for dedupe fallback if the *cdp.Node ptr later goes stale
 
 			if strings.EqualFold(imageId, *untilFlag) {
 				foundUntil = true
@@ -2027,10 +2135,18 @@ func (s *Session) downloadWorker(workerId int, jobs <-chan Job, resultChan chan<
 				isConsecutive = true
 				if errors.Is(err, errAbortBatch) {
 					break
-				} else if errors.Is(err, errAlreadyDownloaded) || errors.Is(err, errStillProcessing) {
+				} else if errors.Is(err, errAlreadyDownloaded) || errors.Is(err, errStillProcessing) || errors.Is(err, errCouldNotLoadPhoto) {
 					if errors.Is(err, errStillProcessing) {
 						// Old highlight videos are no longer available
 						log.Info().Msg("skipping generated highlight video that Google cannot be downloaded")
+						isConsecutive = false
+					} else if errors.Is(err, errCouldNotLoadPhoto) {
+						// Google's SPA hangs on certain photos (a Google bug).
+						// Skip rather than killing the whole sync; cleanup of
+						// any partial files was already done in
+						// downloadAndProcessItem so retrying on a future run
+						// will try the item again.
+						log.Warn().Err(err).Msg("skipping photo whose page failed to load — Google Photos rendering bug")
 						isConsecutive = false
 					}
 					downloadedItemId = ""
@@ -2045,6 +2161,50 @@ func (s *Session) downloadWorker(workerId int, jobs <-chan Job, resultChan chan<
 		errChan <- nil
 	}()
 	return chromedp.FromContext(ctx).Target.TargetID.String()
+}
+
+// verifyPageMatches checks that the currently-rendered page is actually
+// for expectedImageId. Google's SPA can serve different content under a
+// /photo/<id> URL (deleted item fallback, stale routing, etc.) — without
+// this check, getPhotoData could read the wrong photo's data and we'd
+// silently store the wrong file under expectedImageId. The link[rel=canonical]
+// reflects what Google actually decided the page is about, regardless of
+// what the URL bar says.
+//
+// Polls briefly to absorb SPA transitions, then re-navigates once before
+// giving up with errCouldNotLoadPhoto (so the worker skip path handles it).
+func (s *Session) verifyPageMatches(ctx context.Context, log zerolog.Logger, expectedImageId string) error {
+	var lastCanonicalId string
+	for outer := 0; outer < 2; outer++ {
+		for inner := 0; inner < 4; inner++ {
+			var canonical string
+			if err := chromedp.Run(ctx, chromedp.Evaluate(`document.querySelector('link[rel="canonical"]')?.href || ''`, &canonical)); err != nil {
+				return fmt.Errorf("could not read canonical link: %w", err)
+			}
+			if canonical == "" {
+				// No canonical on the page — let it through; getPhotoData
+				// will catch obvious wrong-data via its own selectors.
+				return nil
+			}
+			id, err := imageIdFromUrl(canonical)
+			if err != nil {
+				// Unparseable canonical — don't block on it
+				return nil
+			}
+			lastCanonicalId = id
+			if id == expectedImageId {
+				return nil
+			}
+			time.Sleep(400 * time.Millisecond)
+		}
+		if outer == 0 {
+			log.Debug().Msgf("canonical %s != expected %s after polling; re-navigating", lastCanonicalId, expectedImageId)
+			if err := s.navigateToPhoto(ctx, log, expectedImageId); err != nil {
+				return err
+			}
+		}
+	}
+	return fmt.Errorf("%w: page settled on %s instead of %s after re-navigation", errCouldNotLoadPhoto, lastCanonicalId, expectedImageId)
 }
 
 func (s *Session) doWorkerBatchItem(ctx context.Context, log zerolog.Logger, imageId string, downloadChan <-chan NewDownload, isConsecutive bool) (string, error) {
@@ -2091,6 +2251,10 @@ func (s *Session) doWorkerBatchItem(ctx context.Context, log zerolog.Logger, ima
 	}
 
 	time.Sleep(2 * time.Millisecond)
+
+	if err := s.verifyPageMatches(ctx, log, imageId); err != nil {
+		return "", err
+	}
 
 	isNew, err := s.isNewItem(log, imageId, true)
 	if err != nil {
@@ -2286,7 +2450,7 @@ func (s *Session) getPhotoNodeSelector() string {
 // compiled year regex
 var yearRegex = regexp.MustCompile(`\d{4}`)
 var dayRegex = regexp.MustCompile(`\d{1,2}`)
-var timeRegex = regexp.MustCompile(`(\d{1,2}):(\d\d)(?::\d\d)?.?([aApP][Mm])?$`)
+var timeRegex = regexp.MustCompile(`(\d{1,2}):(\d\d)(?::\d\d)?.?([aApP]\.?[Mm]\.?)?$`)
 var timeZoneRegex = regexp.MustCompile(`GMT([-+])?(\d{1,2})(?::(\d\d))?`)
 
 func parseDate(dateStr, timeStr, tzStr string) (time.Time, error) {
